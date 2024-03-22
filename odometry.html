@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1000, initial-scale=1.0">
+<title>Smoothed Odometry</title>
+<style>
+	html, body { margin:0; padding:0; overflow:hidden; background:#fff }
+	body { text-align:center }
+	canvas { display:block; width:100% }
+	p { margin:0.5em 2em }
+	img { display:none }
+</style>
+</head><body>
+<canvas width="2000" height="870"></canvas>
+<script src="./victor.js"></script>
+<img src="crescendo-field.png">
+<p>Use arrow keys or WASD to drive robot, Q/E to rotate. Space bar resets the trace.</p>
+<p>Red dots show (very noisy) poses from AprilTag detection, which worsen based on distance and off-axis viewing.</p>
+<script>
+const FPS = 50                                 // How many updates we render each second (frames per second)
+const TagMaxVisibleDistance = 5                // How this many meters away there is no chance of detecting an AprilTag
+const TagMaxVisibleOffAxisAngleDegrees = 50    // Beyond this deviation from straight ahead, AprilTag cannot be detected
+const PercentChanceToGetBumpedEachUpdate = 0.5 // 0.5 = 0.5% (not 50%) chance of getting shoved by another bot
+const MaxTraces = 3 * FPS                      // How many seconds should trace data be shown before fading out
+
+// Where are the AprilTags on the field (all values in meters and degrees)
+const Tags = [
+	{id:1,  center:new Victor(15.079, 0.246), rot:120}, // blue source right
+	{id:2,  center:new Victor(16.185, 0.884), rot:120}, // blue source left
+	{id:3,  center:new Victor(16.579, 4.983), rot:180}, // red speaker right
+	{id:4,  center:new Victor(16.579, 5.548), rot:180}, // red speaker center
+	{id:5,  center:new Victor(14.701, 8.204), rot:270}, // red amp
+	{id:6,  center:new Victor( 1.841, 8.204), rot:270}, // blue amp
+	{id:7,  center:new Victor(-0.038, 5.548), rot:  0}, // blue speaker center
+	{id:8,  center:new Victor(-0.038, 4.983), rot:  0}, // blue speaker left
+	{id:9,  center:new Victor( 0.356, 0.884), rot: 60}, // red source right
+	{id:10, center:new Victor( 1.462, 0.246), rot: 60}, // red source left
+	{id:11, center:new Victor(11.905, 3.713), rot:300}, // red stage left
+	{id:12, center:new Victor(11.905, 4.498), rot: 60}, // red stage right
+	{id:13, center:new Victor(11.220, 4.105), rot:180}, // red stage far
+	{id:14, center:new Victor( 5.321, 4.105), rot:  0}, // blue stage far
+	{id:15, center:new Victor( 4.641, 4.498), rot:120}, // blue stage left
+	{id:16, center:new Victor( 4.641, 3.713), rot:240}, // blue stage right
+]
+const Bot = {
+	width: 0.81,
+	length: 0.81,
+	rot: 180,                          // Current rotation, in degrees
+	velocity: new Victor(0),           // How fast is the bot moving?
+	measuredVelocity: new Victor(),    // An imprecise copy of velocity, used to approximate mistakes
+	center:    new Victor(1.35, 5.5),  // Where is the bot REALLY?
+	predicted: new Victor(1.4, 5.548), // Where do we think it is based only on velocity updates?
+	estimated: new Victor(1.4, 5.548), // Where do we think it is based on all sensor data?
+}
+
+const iw = 1435, ih = 624 // field image width and height, in pixels
+const ox = 199, oy = 588  // field origin offset from top left, in pixels
+const m2px = 62.8         // scale of diagram image, in pixels per meter
+
+const can = document.querySelector('canvas'),
+	  ctx = can.getContext('2d'),
+	  img = document.querySelector('img')
+const deg2rad = deg => deg * Math.PI / 180
+
+const traces = {
+	tagPoses    : {color:'magenta', opacity:0.3, data:[]},
+	predictions : {color:'purple',  opacity:0.2, data:[]},
+	actuals     : {color:'orange',  opacity:0.4, data:[]},
+	estimates   : {color:'green',   opacity:0.4, data:[]},
+}
+let traceFrame = 0
+
+// Keep track of which keys are currently held down
+const keyDown = {}
+document.body.focus()
+document.body.addEventListener('keydown', evt => {keyDown[evt.keyCode] = true} )
+document.body.addEventListener('keyup',   evt => {keyDown[evt.keyCode] = false} )
+const Key = {Q:81, E:69, LEFT:37, RIGHT:39, UP:38, DOWN:40, A:65, W:87, S:83, D:68, SPACE:32}
+
+// Recompute and redraw everything; called at FPS times per second
+function update() {
+	ctx.reset()
+	updatePhysics()
+	drawField()
+	drawTraces()
+	drawBot()
+
+	findTags()
+	drawTags()
+	estimatePose()
+
+	traceFrame = ++traceFrame % MaxTraces
+}
+
+// Decide which tags are visible
+// Each visible tag is updated with the (noisy) pose the robot would get from it
+function findTags() {
+	Tags.forEach(tag => {
+		tag.visible = false
+		tag.reportedPose = null
+		tag.distanceFromBot = tag.center.distance(Bot.center)
+
+		// Ensure tags are close enough to see
+		if (tag.distanceFromBot <= TagMaxVisibleDistance) {
+			tag.angleToBot = tag.center.clone().subtract(Bot.center).horizontalAngleDeg() % 360 - 180
+			tag.offAxisAngle = angleDiff(Bot.rot, tag.angleToBot)
+
+			// Ensure tags are inside our field of view, and are facing the camera
+			if ((tag.offAxisAngle <= TagMaxVisibleOffAxisAngleDegrees) && (angleDiff(tag.rot, tag.angleToBot) >= 80)) {
+				tag.reportedPose = poseFromTag(tag)
+				// The pose may fail, simulating AprilTag not being detected despite being nominally visible
+				if (tag.reportedPose) tag.visible = true
+			}
+		}
+	})
+	traces.tagPoses.data[traceFrame] = Tags.filter(tag => tag.reportedPose).map(tag => tag.reportedPose)
+}
+
+// Given a nominally-visible tag, decide if pose detection works; if it does, return the noisy pose it reports
+function poseFromTag(tag) {
+	const chanceOfSuccessFromAngle = Math.pow(((TagMaxVisibleOffAxisAngleDegrees - tag.offAxisAngle) / TagMaxVisibleOffAxisAngleDegrees), 0.2)
+	const chanceOfSuccessFromDistance = tag.distanceFromBot < 1.5 ? 1 : Math.pow(((TagMaxVisibleDistance - tag.distanceFromBot) / TagMaxVisibleDistance), 0.5)
+	const chanceOfSuccess = chanceOfSuccessFromAngle * chanceOfSuccessFromDistance
+
+	// Sometimes we just don't get a pose; sad.
+	if (Math.random() > chanceOfSuccess) return
+
+	// Oh, we're going to get a pose! Let's mess it up somewhat, making it worse as the bot moves farther away or more off-axis
+	const distanceError = 1 - Math.pow(((TagMaxVisibleDistance - tag.distanceFromBot) / TagMaxVisibleDistance), 0.5)
+	const angleError = 1 - chanceOfSuccessFromAngle
+	return Bot.center.clone().subtract(tag.center)
+	       .multiplyScalar((Math.random()-0.5) * 1 * distanceError + 1)
+			 .rotateDeg((Math.random() - 0.5) * 80 * angleError)
+			 .add(tag.center)
+}
+
+// Do our best to guess where the bot really is by fusing together the predicted pose and any tag pose(s)
+function estimatePose() {
+	// Use previous estimate and measured velocity to predict where the bot likely is now
+	// prediction = estimate + measuredVelocity * elapsedTimeThisFrame
+	Bot.predicted.copy(Bot.estimated).add(Bot.measuredVelocity.divideScalar(FPS))
+
+	// We generally trust our predictions, so move the previous estimate 70% towards the new prediction
+	// estimate += (prediction - estimate) * predictionStrength
+	const predictionStrength = 0.7
+	Bot.estimated.mix(Bot.predicted, predictionStrength)
+
+	// If we're ~not moving, heavily smooth AprilTag information to help ignore outliers (move estimate 10% towards each pose)
+	// If we are moving, reduce the smoothing so that we reduce the time lag it takes to adjust (move 50% towards each pose)
+	// estimate += (tagPose - estimate) * aprilTagStrength
+	const absVelo = Bot.measuredVelocity.length()
+	const aprilTagStrength = absVelo < 0.15 ? 0.1 : 0.5
+	Tags.filter(tag => tag.visible).forEach(tag => Bot.estimated.mix(tag.reportedPose, aprilTagStrength))
+
+	// Record the prediction and estimate for graphing
+	traces.predictions.data[traceFrame] = Bot.predicted.clone()
+	traces.estimates.data[traceFrame] = Bot.estimated.clone()
+}
+
+// Draw the robot, including a forward arrow
+function drawBot() {
+	ctx.lineWidth = 0.05
+	ctx.strokeStyle = 'orange'
+
+	ctx.save()
+	ctx.translate(Bot.center.x, Bot.center.y)
+	ctx.rotate(deg2rad(Bot.rot))
+	ctx.strokeRect(-Bot.length/2, -Bot.width/2, Bot.length, Bot.width)
+	ctx.restore()
+
+	ctx.lineWidth = 0.03
+	drawVector(Bot.center, Bot.rot, Bot.length/2 - 0.1)
+}
+
+// Draw all the historical dots for aprilTag poses, predictions, estimates, and actual robot center
+// Fade out older traces
+function drawTraces() {
+	ctx.save()
+	if (keyDown[Key.SPACE]) {
+		// Hitting the space bar erases old traces
+		Object.values(traces).forEach(t => t.data.length=0)
+	} else {
+		for (let i=0; i<MaxTraces; ++i) {
+			const f = ((traceFrame - i) + MaxTraces) % MaxTraces
+			if (traces.actuals.data[f]) {
+				const opacityFade = (1 - i/MaxTraces)*0.9 + 0.1
+				Object.values(traces).forEach(t => {
+					ctx.fillStyle = t.color
+					ctx.globalAlpha = t.opacity * opacityFade
+					const ptOrPoints = t.data[f]
+					if (ptOrPoints) {
+						if (ptOrPoints[0]) {
+							// AprilTags store an array of poses each frame, in case multiple tags are seen at once
+							ptOrPoints.forEach(pt => drawDot(pt, 0.04))
+						} else {
+							drawDot(ptOrPoints, 0.04)
+						}
+					}
+				})
+			}
+		}
+	}
+	ctx.restore()
+}
+
+// Draw dots for each AprilTag
+// Draw direction arrows for those that are detected
+// Draw red dots for the poses coming from detected AprilTags
+function drawTags() {
+	ctx.save()
+	ctx.fillStyle = 'magenta'
+	ctx.strokeStyle = 'magenta'
+	ctx.lineWidth = 0.02
+	Tags.forEach(tag => {
+		drawDot(tag.center, 0.1)
+		if (tag.visible) drawVector(tag.center, tag.rot, 0.5)
+	})
+
+	const visible = Tags.filter(tag => tag.visible)
+	ctx.setLineDash([0.05])
+	ctx.strokeStyle = 'black'
+	ctx.globalAlpha = 0.3
+	visible.forEach(tag => drawLine(Bot.center, tag.center))
+
+	ctx.globalAlpha = 1
+	ctx.fillStyle = 'red'
+	visible.forEach(tag => drawDot(tag.reportedPose, 0.08))
+	ctx.restore()
+}
+
+// Utility function to draw a dot at a vector location
+function drawDot(loc, size=0.1) {
+	ctx.fillRect(loc.x-size/2, loc.y-size/2, size, size)
+}
+
+// Utility function to draw an arrow at an origin, rotated by degrees, with given length
+function drawVector(origin, degrees=0, length=1) {
+	ctx.save()
+	ctx.translate(origin.x, origin.y)
+	ctx.rotate(deg2rad(degrees))
+	ctx.beginPath()
+	ctx.moveTo(0, 0)
+	ctx.lineTo(length, 0)
+	ctx.moveTo(length-0.1, 0.07)
+	ctx.lineTo(length, 0)
+	ctx.lineTo(length-0.1, -0.07)
+	ctx.stroke()
+	ctx.restore()
+}
+
+// Utility function to draw a line between two vector points
+function drawLine(v1, v2) {
+	ctx.beginPath()
+	ctx.moveTo(v1.x, v1.y)
+	ctx.lineTo(v2.x, v2.y)
+	ctx.stroke()
+}
+
+// min/max amount of noise to add to the real velocity when 'measuring' it
+const veloNoiseLowerBound = new Victor(-0.1, -0.1)
+const veloNoiseUpperBound = new Victor(0.1, 0.1)
+
+// Move the robot around based on keyboard controls
+function updatePhysics() {
+	// Rotate the bot by 4 degrees each frame the q/e keys are held down
+	if (keyDown[Key.Q]) Bot.rot += 4
+	if (keyDown[Key.E]) Bot.rot -= 4
+	Bot.rot %= 360
+
+	// Increase x/y velocity by 0.2 m/s each frame the arrow/wasd are held down.
+	// If neither is held down, drop the speed by 20% each frame (to simulate momentum)
+	if (keyDown[Key.LEFT] || keyDown[Key.A]) Bot.velocity.x -= 0.2
+	else if (keyDown[Key.RIGHT] || keyDown[Key.D]) Bot.velocity.x += 0.2
+	else Bot.velocity.x *= 0.8
+
+	if (keyDown[Key.UP] || keyDown[Key.W]) Bot.velocity.y += 0.2
+	else if (keyDown[Key.DOWN] || keyDown[Key.S]) Bot.velocity.y -= 0.2
+	else Bot.velocity.y *= 0.8
+
+	// Clamp velocity to no more than 7 m/s (rough guess at the bot's max speed)
+	const velo = Bot.velocity.length()
+	if (velo > 7) Bot.velocity.multiplyScalar(7 / velo)
+
+	// Move the bot's center due to true velocity
+	// center += velocity * elapsedTimeThisFrame
+	Bot.center.add(Bot.velocity.clone().divideScalar(FPS))
+
+	// Make up a slightly noisy velocity that we'll use to predict bot movement
+	Bot.measuredVelocity.randomize(veloNoiseLowerBound, veloNoiseUpperBound).add(Bot.velocity)
+
+	// Maybe bump the bot from an unseen collision
+	// Bumps are random amounts up to +/- 0.4m per axis; perhaps sometimes on both
+	if (Math.random() < PercentChanceToGetBumpedEachUpdate/100) {
+		const bumpMode = Math.random()
+		if (bumpMode < 0.7) Bot.center.x += (Math.random() - 0.5) * 0.4
+		if (bumpMode > 0.3) Bot.center.y += (Math.random() - 0.5) * 0.4
+	}
+
+	// Record the current center of the bot for later drawing historical positions
+	traces.actuals.data[traceFrame] = Bot.center.clone()
+}
+
+// Draw the field diagram
+function drawField() {
+	// Fill the width of the browser with the image
+	ctx.drawImage(img, 0, 0, can.width, can.width / iw * ih)
+
+	// Set the transform so that drawing things based on meters and
+	// field coordinates work as expected
+	const scale = can.width / (iw / m2px)
+	ctx.scale(scale, -scale)
+	ctx.translate(ox/m2px, -oy/m2px)
+}
+
+// Find the absolute difference between two degree angles, in the range [0,180]
+function angleDiff(deg1, deg2) {
+	return Math.abs(((deg1 - deg2) + 360) % 360 - 180)
+}
+
+// call stop()/start() from the console if you want to control the updates
+let timer
+function start() { timer = setInterval(update, 1000/FPS) }
+function stop() { clearInterval(timer) }
+
+start()
+</script>
+</body>
+</html>
