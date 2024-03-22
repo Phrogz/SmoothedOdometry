@@ -7,7 +7,7 @@ for fusing together velocity-based odometry with one or more AprilTag detections
 
 Copy the files into a directory and open the HTML file with a web browser. If
 all goes well you should see something similar to this video:
-https://youtu.be/wmUtdmmf6cU?si=blGLNwbDpzYoYp5q
+https://youtu.be/wmUtdmmf6cU
 
 Use WASD or the arrow keys to move the robot. Use Q/E to rotate the bot.
 
